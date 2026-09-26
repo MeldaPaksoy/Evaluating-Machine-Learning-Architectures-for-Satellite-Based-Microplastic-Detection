@@ -1,7 +1,7 @@
 """
 01_data_preprocessing_and_matching.py
 - Level-3 NetCDF artifact filtering (_FillValue, missing_value, 0.05 calibration flag).
-- Monthly mean aggregation of Kd_490 with duplicate prevention.
+- Monthly domain-averaged composite extraction of Kd_490 from NetCDF archives.
 - Vectorized spatial proximity matching (Euclidean distance <= 0.40 deg) with Chlorophyll-a via cKDTree.
 - Cyclical coordinate encoding (sin/cos) and harmonization into final tabular CSV.
 """
@@ -28,7 +28,7 @@ OUTPUT_ALIGNED_CSV = os.path.join(DATA_DIR, "merged_dataset_with_diffuse_attenua
 
 
 def extract_kd490_monthly_means(netcdf_folder: str, output_csv: str = None) -> pd.DataFrame:
-    """Computes monthly spatial averages for Kd_490 from NetCDF archives."""
+    """Computes monthly domain-averaged composites for Kd_490 from NetCDF archives."""
     print("Step 1: Extracting monthly spatial averages for Kd_490...")
     nc_files = sorted(glob.glob(os.path.join(netcdf_folder, "*.nc")))
     records = []
