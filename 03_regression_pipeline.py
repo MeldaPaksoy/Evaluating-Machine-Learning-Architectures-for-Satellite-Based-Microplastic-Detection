@@ -4,7 +4,7 @@ Continuous concentration regression on native physical scale (pieces/m³):
 1. RandomizedSearchCV Hyperparameter Optimization (XGBoost & Random Forest)
 2. Soft Voting (MAE-weighted) and Ridge Meta-Stacking
 3. Scikit-Learn StackingRegressor Pipeline (Out-Of-Fold Safe)
-4. 5-Fold Cross-Validation (Linear Regression with log1p & Random Forest)
+4. 5-Fold Cross-Validation (Linear Regression with log1p & Random Forest max_depth=6)
 """
 
 import os
@@ -26,9 +26,6 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 import xgboost as xgb
 
-# ==============================================================================
-# CONFIGURATION & HYPERPARAMETERS (PLACEHOLDERS)
-# ==============================================================================
 RANDOM_STATE = 42
 N_ITER_SEARCH = 30
 CV_FOLDS = 3
@@ -84,7 +81,7 @@ def main():
     X = df_clean[all_features].values
     y = df_clean[target].values
 
-    # Train %70, Val %10, Test %20
+    # Train %70, Val %10, Test %20 (80% Development, 20% Quarantined Test)
     X_train_full, X_test, y_train_full, y_test = train_test_split(
         X, y, test_size=0.2, random_state=RANDOM_STATE
     )
@@ -100,7 +97,7 @@ def main():
 
     # 1. Base Modeller ve Hiperparametre Optimizasyonu
     print("\n--- Training Linear Regression ---")
-    lr_model = LinearRegression()
+    lr_model = LinearRegression(fit_intercept=True)
     lr_model.fit(X_train_scaled, y_train)
     lr_preds = lr_model.predict(X_test_scaled)
     mae_lr_test, rmse_lr_test, r2_lr_test = calculate_regression_metrics(y_true, lr_preds)
@@ -135,13 +132,13 @@ def main():
     print("\n--- Hyperparameter Tuning RandomForest ---")
     rf_param_dist = {
         "n_estimators": randint(100, 800),
-        "max_depth": [None] + list(randint.rvs(5, 20, size=5)),
+        "max_depth": [6],
         "min_samples_split": randint(2, 20),
         "min_samples_leaf": randint(1, 10),
         "max_features": uniform(0.5, 0.5),
     }
     rf_search = RandomizedSearchCV(
-        estimator=RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1),
+        estimator=RandomForestRegressor(random_state=RANDOM_STATE, max_depth=6, n_jobs=-1),
         param_distributions=rf_param_dist,
         n_iter=N_ITER_SEARCH,
         scoring=mae_scorer,
@@ -179,7 +176,7 @@ def main():
     meta_features_val = np.column_stack(
         (lr_val_preds, xgb_search.predict(X_val), rf_search.predict(X_val))
     )
-    meta_model = Ridge(alpha=1.0)
+    meta_model = Ridge(alpha=1.0, fit_intercept=True)
     meta_model.fit(meta_features_val, y_val)
     meta_features_test = np.column_stack((lr_preds, xgb_preds, rf_preds))
     ensemble_y_pred_stacking = meta_model.predict(meta_features_test)
@@ -205,7 +202,7 @@ def main():
     stack_pipeline = StackingRegressor(
         estimators=[("xgb", xgb_model), ("rf", rf_model)],
         final_estimator=Pipeline(
-            [("scaler", StandardScaler()), ("ridge", Ridge(alpha=1.0))]
+            [("scaler", StandardScaler()), ("ridge", Ridge(alpha=1.0, fit_intercept=True))]
         ),
         cv=5,
         n_jobs=-1
@@ -215,40 +212,21 @@ def main():
     mae_sp, rmse_sp, r2_sp = calculate_regression_metrics(y_true, stack_preds_pipe)
     print(f"StackingRegressor OOF: MAE={mae_sp:.4f}, RMSE={rmse_sp:.4f}, R2={r2_sp:.4f}")
 
-    # 4. 5-Fold Cross-Validation (Log Dönüşümlü Linear Regression)
+    # 4. 5-Fold Cross-Validation (Log Dönüşümlü Linear Regression - Snapshot Base)
     print("\n--- Linear Regression 5-Fold CV (np.log1p) ---")
-    df_clean["microplastics_log"] = np.log1p(df_clean[target])
-
-    def create_sequences_reg(data_frame, feats, target_c, w_size):
-        seqs, tgts = [], []
-        df_sort = data_frame.sort_values(["latitude", "longitude", "date"])
-        for _, grp in df_sort.groupby(["latitude", "longitude"]):
-            X_g = grp[feats].values
-            y_g = grp[target_c].values
-            if len(X_g) < w_size:
-                continue
-            for i in range(len(X_g) - w_size + 1):
-                seqs.append(X_g[i : i + w_size].flatten())
-                tgts.append(y_g[i + w_size - 1])
-        return np.array(seqs), np.array(tgts)
-
-    X_seq_reg, y_seq_log = create_sequences_reg(df_clean, all_features, "microplastics_log", 6)
-    X_tr_r, X_te_r, y_tr_r, y_te_r = train_test_split(
-        X_seq_reg, y_seq_log, test_size=0.2, random_state=42
-    )
-
-    kf_reg = KFold(n_splits=5, shuffle=True, random_state=42)
+    y_train_log = np.log1p(y_train_full)
+    kf_reg = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     mae_log_scores, rmse_log_scores, r2_log_scores = [], [], []
 
-    for tr_i, val_i in kf_reg.split(X_tr_r):
-        X_tr_fold, X_v_fold = X_tr_r[tr_i], X_tr_r[val_i]
-        y_tr_fold, y_v_fold = y_tr_r[tr_i], y_tr_r[val_i]
+    for tr_i, val_i in kf_reg.split(X_train_full):
+        X_tr_fold, X_v_fold = X_train_full[tr_i], X_train_full[val_i]
+        y_tr_fold, y_v_fold = y_train_log[tr_i], y_train_log[val_i]
 
         sc_fold = StandardScaler()
         X_tr_fold_s = sc_fold.fit_transform(X_tr_fold)
         X_v_fold_s = sc_fold.transform(X_v_fold)
 
-        lr_log = LinearRegression()
+        lr_log = LinearRegression(fit_intercept=True)
         lr_log.fit(X_tr_fold_s, y_tr_fold)
 
         y_v_pred_log = lr_log.predict(X_v_fold_s)
@@ -264,9 +242,9 @@ def main():
     print(f"5-Fold CV Mean RMSE (LR log1p): {np.mean(rmse_log_scores):.4f}")
     print(f"5-Fold CV Mean R2 (LR log1p): {np.mean(r2_log_scores):.4f}")
 
-    # 5. 5-Fold Cross-Validation (Random Forest)
+    # 5. 5-Fold Cross-Validation (Random Forest, max_depth=6)
     print("\n--- Random Forest 5-Fold CV ---")
-    kf_rf = KFold(n_splits=5, shuffle=True, random_state=42)
+    kf_rf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     rf_mae_scores, rf_rmse_scores, rf_r2_scores = [], [], []
 
     for tr_idx, val_idx in kf_rf.split(X_train_full):
@@ -278,7 +256,7 @@ def main():
         X_val_k_s = sc_rf.transform(X_val_k)
 
         rf_cv_m = RandomForestRegressor(
-            n_estimators=500, max_depth=None, random_state=42, n_jobs=-1
+            n_estimators=500, max_depth=6, random_state=RANDOM_STATE, n_jobs=-1
         )
         rf_cv_m.fit(X_tr_k_s, y_tr_k)
         y_pred_rf = rf_cv_m.predict(X_val_k_s)
