@@ -1,4 +1,3 @@
-
 """
 02_classification_pipeline.py
 K-Means spatial regimes (k=5), retrospective sliding window (W=6),
@@ -38,7 +37,7 @@ from tensorflow.keras.utils import to_categorical
 import xgboost as xgb
 
 # ==============================================================================
-# CONFIGURATION & HYPERPARAMETERS (PLACEHOLDERS)
+# CONFIGURATION & REPRODUCIBILITY SEEDS
 # ==============================================================================
 RANDOM_STATE = 42
 WINDOW_SIZE = 6
@@ -60,33 +59,41 @@ def mean_confidence_interval(data, confidence: float = 0.95):
     return mean, h
 
 
-def build_lstm_model(nfeatures: int, n_classes: int, params: dict, bidirectional: bool = False):
-    model = Sequential()
-    model.add(Input(shape=(WINDOW_SIZE, nfeatures)))
-    model.add(Masking(mask_value=0.0))
-    if bidirectional:
-        model.add(
-            Bidirectional(
-                LSTM(params["units1"], activation="tanh", return_sequences=True)
-            )
-        )
-    else:
-        model.add(
-            LSTM(params["units1"], activation="tanh", return_sequences=True)
-        )
-    model.add(BatchNormalization())
-    model.add(Dropout(params["dropout1"]))
-    if bidirectional:
-        model.add(Bidirectional(LSTM(params["units2"], activation="tanh")))
-    else:
-        model.add(LSTM(params["units2"], activation="tanh"))
-    model.add(BatchNormalization())
-    model.add(Dropout(params["dropout2"]))
-    model.add(Dense(params["dense_units"], activation="relu"))
-    model.add(Dense(n_classes, activation="softmax"))
+def build_standard_lstm(nfeatures: int, n_classes: int):
+    """Standard LSTM architecture matching Table 1 (64 units, Dense 32)."""
+    model = Sequential([
+        Input(shape=(WINDOW_SIZE, nfeatures)),
+        Masking(mask_value=0.0),
+        LSTM(64, activation="tanh"),
+        Dropout(0.30),
+        Dense(32, activation="relu"),
+        Dense(n_classes, activation="softmax")
+    ])
     model.compile(
         loss="categorical_crossentropy",
-        optimizer=tf.keras.optimizers.Adam(learning_rate=params["learning_rate"]),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        metrics=["accuracy"]
+    )
+    return model
+
+
+def build_bilstm_model(nfeatures: int, n_classes: int):
+    """Bidirectional LSTM matching Table 1 (L1=192, L2=96, Dense 64)."""
+    model = Sequential([
+        Input(shape=(WINDOW_SIZE, nfeatures)),
+        Masking(mask_value=0.0),
+        Bidirectional(LSTM(192, activation="tanh", return_sequences=True)),
+        BatchNormalization(),
+        Dropout(0.25),
+        Bidirectional(LSTM(96, activation="tanh")),
+        BatchNormalization(),
+        Dropout(0.25),
+        Dense(64, activation="relu"),
+        Dense(n_classes, activation="softmax")
+    ])
+    model.compile(
+        loss="categorical_crossentropy",
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
         metrics=["accuracy"]
     )
     return model
@@ -155,15 +162,6 @@ def main():
         "CatBoost": [],
         "Ensemble": [],
     }
-    default_params = {
-        "units1": 128,
-        "units2": 64,
-        "dropout1": 0.25,
-        "dropout2": 0.25,
-        "dense_units": 64,
-        "learning_rate": 1e-3,
-        "batch_size": 64,
-    }
 
     fold = 1
     for train_idx, test_idx in kf.split(X_seq, y_seq):
@@ -182,19 +180,19 @@ def main():
             X_test_seq.reshape(-1, nfeatures)
         ).reshape(X_test_seq.shape)
 
-        # 1. LSTM
-        lstm_model = build_lstm_model(nfeatures, n_classes, default_params, bidirectional=False)
-        lstm_model.fit(X_train_scaled, y_train_cat, epochs=5, batch_size=64, verbose=0)
+        # 1. Standard LSTM
+        lstm_model = build_standard_lstm(nfeatures, n_classes)
+        lstm_model.fit(X_train_scaled, y_train_cat, epochs=50, batch_size=64, verbose=0)
         lstm_pred = np.argmax(lstm_model.predict(X_test_scaled, verbose=0), axis=1)
         metrics_dict["LSTM"].append(lstm_pred)
 
-        # 2. BiLSTM
-        bilstm_model = build_lstm_model(nfeatures, n_classes, default_params, bidirectional=True)
-        bilstm_model.fit(X_train_scaled, y_train_cat, epochs=5, batch_size=64, verbose=0)
+        # 2. Bidirectional LSTM
+        bilstm_model = build_bilstm_model(nfeatures, n_classes)
+        bilstm_model.fit(X_train_scaled, y_train_cat, epochs=50, batch_size=64, verbose=0)
         bilstm_pred = np.argmax(bilstm_model.predict(X_test_scaled, verbose=0), axis=1)
         metrics_dict["BiLSTM"].append(bilstm_pred)
 
-        # 3. XGBoost
+        # 3. XGBoost Classifier
         X_train_flat = X_train_seq[:, -1, :]
         X_test_flat = X_test_seq[:, -1, :]
         classes_arr = np.unique(y_train_seq_fold)
@@ -208,16 +206,27 @@ def main():
             num_class=n_classes,
             use_label_encoder=False,
             eval_metric="mlogloss",
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=0.5,
             random_state=RANDOM_STATE
         )
         xgb_model.fit(X_train_flat, y_train_seq_fold, sample_weight=sample_weights)
         xgb_pred = xgb_model.predict(X_test_flat)
         metrics_dict["XGBoost"].append(xgb_pred)
 
-        # 4. CatBoost
+        # 4. CatBoost Classifier
         cat_model = CatBoostClassifier(
+            iterations=1500,
+            learning_rate=0.03,
+            depth=6,
+            l2_leaf_reg=4,
             loss_function="MultiClass",
             verbose=0,
+            random_seed=RANDOM_STATE,
             class_weights=dict(zip(classes_arr, weights))
         )
         X_train_cat = pd.DataFrame(X_train_flat, columns=all_features)
